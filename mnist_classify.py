@@ -11,8 +11,6 @@ import torch.optim as optim
 import torch.distributed as dist
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 
 
 """
@@ -90,38 +88,7 @@ def test(model, device, test_loader):
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
-######################## DDP ##############################
-def ddp_setup():
-    # Get our world_size from the SLURM environment
-    world_size = int(os.environ["SLURM_NTASKS"])
-    # Get our rank from the SLURM environment
-    rank = int(os.environ["SLURM_PROCID"])
-
-    # Figure out our local rank based on the global rank and number of GPUS per node
-    # Here, we assume you are using 1 GPU per rank. If not, you may alter this logic
-    # and use e.g. SLURM_NTASKS_PER_NODE instead
-    tasks_per_node = int(os.environ["SLURM_NTASKS_PER_NODE"])
-    # local_rank = rank - tasks_per_node * (rank // tasks_per_node)
-    local_rank = int(os.environ["SLURM_LOCALID"])
-
-    # Set the default device before initializing the process group
-    # As per recommendation on https://pytorch.org/tutorials/beginner/ddp_series_multigpu.html#constructing-the-process-group
-    torch.cuda.set_device(local_rank)
-
-    # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-    # Check group initialization and report ranks
-    if rank == 0: print(f"Group initialized? {dist.is_initialized()}", flush=True)
-    print(f"host: {gethostname()}, rank: {rank}, local_rank: {local_rank}")
-
-    return rank, local_rank
-
-def cleanup():
-    # clean up the distributed environment
-    dist.destroy_process_group()
-######################## DDP ##############################
-    
+   
     
     
 def main():
@@ -167,53 +134,28 @@ def main():
     test_dset = datasets.MNIST(MNIST_DATA, train=False,
                        transform=transform)
     
-    ######################## DDP ##############################
-
-    rank, local_rank = ddp_setup()
-
-    ######################## DDP ##############################
-    train_loader = torch.utils.data.DataLoader(train_dset, sampler=DistributedSampler(train_dset),
+    train_loader = torch.utils.data.DataLoader(train_dset,
                                                batch_size=args.batch_size, shuffle=False, 
                                                num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dset, batch_size=args.test_batch_size,
                                                num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]), pin_memory=True)
     
-    ######################## DDP ##############################
-    model = Net().to(local_rank)
-    ddp_model = DDP(model, device_ids=[local_rank])
-    optimizer = optim.Adadelta(ddp_model.parameters(), lr=args.lr)
-    ######################## DDP ##############################
+    gpu_id = 0
+    model = Net().to(gpu_id)
+    optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(1, args.epochs + 1):
-        # Measure training loop throughput
-        # Make sure all ranks have reached this point before we start the timer
-        # NB: you wouldn't use these barriers in production code, we only use it to get precies timings on the train loop time
-        dist.barrier()
-        # Time the train step
         t_start = time.time()
-        train_loader.sampler.set_epoch(epoch)      
-        train(args, ddp_model, local_rank, train_loader, optimizer, epoch)
-        # Make sure all ranks have finished before stopping the timer
-        dist.barrier()
+        train(args, model, gpu_id, train_loader, optimizer, epoch)
         t_end = time.time()
-        # For easier readibility, make sure output from all ranks is flushed before we print performance
-        sys.stdout.flush()
-        dist.barrier()
-        throughput_per_worker = len(train_loader)*args.batch_size/(t_end - t_start)
-        aggregate_throughput = dist.get_world_size() * throughput_per_worker
-        if rank == 0: print(f"Train step in epoch {epoch} took {t_end - t_start:.4f} seconds. Average throughput per worker: {throughput_per_worker:.2f} images/s. Aggregate throughput: {aggregate_throughput:.2f}", flush=True)
-
-        if rank == 0: test(ddp_model, local_rank, test_loader)
+        throughput = len(train_loader)*args.batch_size/(t_end - t_start)
+        print(f"Train step in epoch {epoch} took {t_end - t_start:.4f} seconds. Average throughput: {throughput:.2f} images/s.")
+        test(model, gpu_id, test_loader)
         scheduler.step()
-    # Make sure we print this last
-    sys.stdout.flush()
 
     if args.save_model and rank == 0:
-        torch.save(ddp_model.state_dict(), "mnist_cnn.pt")
-
-    cleanup()
-
+        torch.save(model.state_dict(), "mnist_cnn.pt")
 
 if __name__ == '__main__':
     main()
